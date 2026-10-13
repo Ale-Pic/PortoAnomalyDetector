@@ -17,3 +17,191 @@ Being a time series, the process is also unlikely to exhibit one-time anomalies 
 More classical machine learning challenges are also significant. Both algorithms require tuning of a smoothing parameter, and fixing it as a scalar rather than have it vary across variables may not be the most sensible choice. A training-validation-testing scheme must be established. 16 variables already approaches curse-of-dimensionality territory. A criterion to compute an anomaly threshold is needed. And crucially, we need to be careful to assume a single stable distribution is generating the data, which ties back to the time series problem.
 
 This project will tackle all these questions, starting from a more naive attempt to illustrate possible shortcomings and points of strength of such a methodology, and gradually moving on towards a model with more calibrated assumptions; the ultimate goal is for the density estimator we choose to delineate a threshold guaranteeing a ceiling on false alarms, investigating performance on possible failures, and confirming the threshold is calibrated to the chosen false alarm rate.
+
+## Basic setup for KDEs and KNNs
+
+KDEs are a popular algorithm to estimate a density function non-parametrically given a dataset. A new point's density is computed as an average of so called *kernel functions* of it; a kernel function is a measure of distance between the new point and an observation in the training dataset, respecting specific properties, and one such function for every training datapoint concurs in the average. Kernel functions are additionally regulated by a parameter called *bandwidth*, where higher values lead to a smoother density function estimated. A smoother function generalizes better but also becomes less sensitive to peculiar local pattern in the data, a classic case of bias-variance trade-off.
+
+KNNs are another popular non-parametric algorithm, normally employed for classification. However, it can be re-adapted to density estimation: the density estimate is proportional to the volume of the smallest ball, or neighborhood in 1D, around a new point that contains at least a pre-chosen number of training datapoints K. For example, a density for a point may be constant/4 if you need a ball with a volume of 4 units centered in the point to find K=5 training observations. The *K* parameter here serves a similar purpose to a KDE's bandwidth; requiring to find more neighbors through a higher K will lead to smoother estimates.
+
+We can therefore use both algorithms on the dataset to derive an estimate of the joint distribution of all the MetroPT variables *under normalcy*. That clearly requires removal of the documented failure periods from the dataset, which will introduce an additional challenge. Once such a density is estimated (we'll use log-space for numerical tractability), an easy choice for an anomaly score definition for a new point is to simply flip the sign of the estimated density.
+
+From such estimates, a quantile can be approximated, which is supposed to give a guarantee that a system trained as-is will only raise false alarms X% of the time when everything is normal, a close parallel to the alpha guarantee of hypothesis testing.
+
+## A first naive attempt
+
+We'll make a first attempt to fit a KDE to the dataset and test its performance. This is meant to put to test the simplest version of the algorithms, both as a show-of-concept and to highlight why the peculiarities of the studied phenomenon require additional machinery.
+
+First, the observations from the failure periods are simply removed from the dataset, as is the timestamp variable. Then, the dataset is split into a training-validation-test partition, according to a *walk-forward* scheme: the first 50.000 observations are used to fit a KDE (training), which then estimates the density of the following 10.000 observations (validation). A sanity gap of 100 observations is removed from the rightmost side of the 50.000-unit block during training. After that, the window is shifted 50.000 observations forward: observations 50.001-100.000 train a new KDE, and observations 100.001-110.000 receive score estimations; this is repeated until the dataset is exhausted, except for the final part allocated for the test set. All the estimated anomaly scores form an *empirical distribution*, and we compute its 95% quantile (where the 95% is chosen here for simplicity and can be changed later), which will be our *anomaly threshold*. As for the test set, of the last 60.000 observations, the first 50.000 (minus the sanity gap) are used to fit a final KDE, which then estimates the anomaly scores of the remaining 10.000. The proportion of scores above the anomaly threshold is the effective alarm rate of the model, if trained this way; ideally, we'd want it to be close to our nominal 5% level.
+
+The point of the walk-forward scheme is to prevent *leakage*. Specifically, because contiguous observations in time are likely to be tightly correlated, a random dataset split could inadvertently select the validation set from observations that are too correlated with the training set ones, a violation of the unstated IID assumption. For the same reason, a short sanity gap closes a training block.
+
+Undoubtedly, this effectively slightly shifts the question answered by the model: rather than "how do we use our dataset to fit an estimator of the anomaly score and find an alarm threshold?", it becomes a narrower "when fitting an estimator on a block of past observations, how do we estimate *future* anomaly scores and set a threshold?" Such a shift would also entail that such a model couldn't be trained only once and stay frozen after hypothetical deployment.
+
+In order to prevent memory saturation during training, which occurs if the whole million-datapoint dataset is loaded at once and computed on, Codex was used to write a preliminary [script](https://github.com/Ale-Pic/PortoAnomalyDetector/blob/main/metropt_preprocessing.py) that, combining Pandas reading and NumPy's functions to create, write and load memory-mapped arrays, allows us to keep the dataset in a cached format and only read a chunk at a time without filling the RAM. Before doing so, the failure periods are excluded.
+
+Once that is done, we can proceed to [training](https://github.com/Ale-Pic/PortoAnomalyDetector/tree/main), using the off-the-shelf KDE class from Scikit-learn for the moment.
+
+Before finally proceeding, it is necessary to pick a bandwidth. In order to do that, we use a [validation scheme](https://github.com/Ale-Pic/PortoAnomalyDetector/blob/main/KDE_naive_bandwidth.py) where on the same folds we'll use to calibrate the threshold, we use the training set to fit a KDE, and through it compute the mean likelihood of the validation set datapoints. Indeed, bandwidths that more closely capture the underlying distribution and therefore better predict unseen datapoints, are expected to induce higher densities for validation data.
+
+We first explore the \[0.00005, 2\] on a logarithmic scale:
+
+```
+Bandwidth: 5e-05
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -41484593.76499272
+Chosen surprise score threshold: 113378266.04953867
+Bandwidth: 8.733406762343067e-05
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -13575388.576312259
+Chosen surprise score threshold: 37001030.75363008
+Bandwidth: 0.0001525447873530791
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -4463035.036044831
+Chosen surprise score threshold: 12194563.873419099
+Bandwidth: 0.00026644713548591297
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -1337416.5341005658
+Chosen surprise score threshold: 2259900.3646622333
+Bandwidth: 0.0004653982429719224
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -427607.2914924021
+Chosen surprise score threshold: 613876.0304626963
+Bandwidth: 0.0008129024324707131
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -136957.7534455248
+Chosen surprise score threshold: 168147.37306407746
+Bandwidth: 0.0014198815201729696
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -43990.208423327276
+Chosen surprise score threshold: 44602.99530545603
+Bandwidth: 0.0024800805740009136
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -14379.742844036888
+Chosen surprise score threshold: 15886.49509710524
+Bandwidth: 0.004331910491227047
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -4578.993374558336
+Chosen surprise score threshold: 4318.709066555501
+Bandwidth: 0.0075664672755894275
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -1456.5079100334856
+Chosen surprise score threshold: 1335.4335565715312
+Bandwidth: 0.013216207294336048
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -442.6809406941122
+Chosen surprise score threshold: 371.40119319980295
+Bandwidth: 0.023084502831376422
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -119.59854002580774
+Chosen surprise score threshold: 65.86450357065567
+Bandwidth: 0.04032127062657407
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -22.989388265399963
+Chosen surprise score threshold: 8.937349320771178
+Bandwidth: 0.07042841151127738
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 2.6773437359230265
+Chosen surprise score threshold: 5.217825109671389
+Bandwidth: 0.12301599307073392
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 5.897090919610441
+Chosen surprise score threshold: -0.6451789667530328
+Bandwidth: 0.21486974115205915
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 1.7517982459228585
+Chosen surprise score threshold: 2.7132932510442984
+Bandwidth: 0.3753089700800592
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -4.507158729598154
+Chosen surprise score threshold: 8.39472899529902
+Bandwidth: 0.6555451794530402
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -11.437247099779434
+Chosen surprise score threshold: 14.606253367246579
+Bandwidth: 1.145028540651314
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -18.760865522586702
+Chosen surprise score threshold: 21.29693548513366
+Bandwidth: 2.0
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -26.28910621530878
+Chosen surprise score threshold: 28.34395011477453
+```
+
+We can see that the optimal bandwidth appears to be around 0.125. We therefore try a new narrower interval on a linear scale, \[0.06, 0.2\]:
+
+```
+Bandwidth: 0.06
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: -1.0283783785898737
+Chosen surprise score threshold: 8.355037779570372
+Bandwidth: 0.07166666666666667
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 3.024874480937731
+Chosen surprise score threshold: 4.764609802386046
+Bandwidth: 0.08333333333333333
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 4.906713189417252
+Chosen surprise score threshold: 1.7952449221862343
+Bandwidth: 0.095
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 5.656595398745882
+Chosen surprise score threshold: 0.2567725125096773
+Bandwidth: 0.10666666666666666
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 6.233782030861886
+Chosen surprise score threshold: -0.4469546881579593
+Bandwidth: 0.11833333333333333
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 5.771310380480807
+Chosen surprise score threshold: -0.6477963591437754
+Bandwidth: 0.13
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 5.679538110270947
+Chosen surprise score threshold: -0.5630462210786537
+Bandwidth: 0.14166666666666666
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 5.205412910691869
+Chosen surprise score threshold: -0.2960077335824991
+Bandwidth: 0.15333333333333332
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 4.627983644423841
+Chosen surprise score threshold: 0.07601194623744821
+Bandwidth: 0.165
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 4.123974000578845
+Chosen surprise score threshold: 0.5317246771797207
+Bandwidth: 0.17666666666666667
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 3.588195885263229
+Chosen surprise score threshold: 1.0013142391556618
+Bandwidth: 0.18833333333333332
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 3.0170919369325566
+Chosen surprise score threshold: 1.499956894375093
+Bandwidth: 0.2
+Training the model in 29 steps...
+Trained step 28/29           The bandwidth induces a mean log-likelihood of: 2.468593632072007
+Chosen surprise score threshold: 2.0307635107333017
+```
+
+At this point, we can pick 0.107 as the optimal bandwidth, and we're ready for the naive attempt.
+
+Not surprisingly, this is the result when running KDE_naive_test.py:
+
+```
+Training the model in 28 steps...
+Chosen surprise score threshold: 12.092519612218053
+The model as-fitted raises 69 failures on the test dataset, a failure rate of 0.0069.
+```
+
+(Prints currently irrelevant were hidden.)
+
+As we can see, the estimator performs poorly on the test dataset, though probably in the opposite direction from what we would expect blindfolded: the model raises 7 times fewer alarms than the nominal rate of 5% we chose in advance.
+
+We therefore need to investigate what could cause the discrepancy, both among the candidates we singled out in the introduction and by inspecting the estimator.
+
+## Diagnosis
+
+> To be continued
